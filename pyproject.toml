@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Sentinel1Phase"
+version = "0.1.0"
+description = "Sentinel-1 interferogram to GrIMP unwrapped-product workflow"
+requires-python = ">=3.9"
+# Runtime deps (utilities, sarfunc, nisarfunc, isce2grimp, isce) are provided
+# by the conda environment as local/editable installs, not from PyPI.
+dependencies = []
+
+[project.scripts]
+runS1interferogram = "runS1interferogram:main"
+findS1InsarPairs = "findS1InsarPairs:main"
+setupS1PhaseTracks = "setupS1PhaseTracks:main"
+
+[tool.setuptools]
+# Flat layout: install the workflow scripts as importable top-level modules.
+py-modules = ["uwproject", "isceenv", "azPhaseCorrect", "setupisceuw", "runS1interferogram", "findS1InsarPairs", "setupS1PhaseTracks"]
