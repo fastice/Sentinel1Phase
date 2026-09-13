@@ -166,24 +166,46 @@ def getLOS(fileName, nrlks=30, nalks=6):
     return {'incidence': incidence, 'azAngle': azAngle}
 
 
-def interpVelBand(velFile, band, llxy, sigma, pad=3000, noData=-2.0e9):
-    ''' Interpolate one band (1=vx, 2=vy) of a multi-band velocity map (VRT or
-    tiff, in the same polar-stereo grid as llxy) onto the radar-grid points in
-    llxy. Same crop+interpolate pattern as getSlopes. '''
+_velCache = {}
+_velCacheLock = threading.Lock()
+
+
+def readVelCrop(velFile, llxy, pad=3000):
+    ''' Crop every band of the velocity map to the llxy footprint in a single
+    read, and return (data, x, y).
+
+    The dataset handle is opened once and cached: with a handle per call the
+    correction opened the map (and, for a VRT, its component tiffs) 27 times
+    per pair, which is slow over NFS on any host that does not hold the map
+    locally. The read is done under a lock because rasterio/GDAL dataset
+    objects are not safe for concurrent reads, and because serializing keeps
+    the 5 correction threads from hitting a remote mount at once. Only the
+    read is locked; filtering and interpolation stay parallel. '''
     valid = np.abs(llxy['lat']) > 0
-    vel = rioxarray.open_rasterio(velFile)
-    box = {}
-    for coord in ['x', 'y']:
-        box[f'min{coord}'] = max(np.round(np.min(llxy[coord][valid]) - pad,
-                                          decimals=-3),
-                                 vel[coord].min().values.item())
-        box[f'max{coord}'] = min(np.round(np.max(llxy[coord][valid]) + pad,
-                                          decimals=-3),
-                                 vel[coord].max().values.item())
-    velCrop = vel.rio.clip_box(**box)
-    data = np.flipud(velCrop.data[band - 1]).astype(float)
-    x = velCrop.x.values
-    y = np.flipud(velCrop.y.values)
+    with _velCacheLock:
+        if velFile not in _velCache:
+            _velCache[velFile] = rioxarray.open_rasterio(velFile)
+        vel = _velCache[velFile]
+        box = {}
+        for coord in ['x', 'y']:
+            box[f'min{coord}'] = max(np.round(np.min(llxy[coord][valid]) - pad,
+                                              decimals=-3),
+                                     vel[coord].min().values.item())
+            box[f'max{coord}'] = min(np.round(np.max(llxy[coord][valid]) + pad,
+                                              decimals=-3),
+                                     vel[coord].max().values.item())
+        velCrop = vel.rio.clip_box(**box)
+        return velCrop.data, velCrop.x.values, velCrop.y.values
+
+
+def interpVelBand(velData, band, velX, velY, llxy, sigma, noData=-2.0e9):
+    ''' Interpolate one band (1=vx, 2=vy) of a cropped multi-band velocity map
+    (from readVelCrop, in the same polar-stereo grid as llxy) onto the
+    radar-grid points in llxy. '''
+    valid = np.abs(llxy['lat']) > 0
+    data = np.flipud(velData[band - 1]).astype(float)
+    x = velX
+    y = np.flipud(velY)
     data[data <= noData + 1] = np.nan
     data = gaussian_filter(np.nan_to_num(data), sigma=sigma)
     f = RegularGridInterpolator((y, x), data, method='linear',
@@ -193,21 +215,49 @@ def interpVelBand(velFile, band, llxy, sigma, pad=3000, noData=-2.0e9):
     return out
 
 
+_maskCache = {}
+_maskCacheLock = threading.Lock()
+
+
+def getIceMask(maskFile):
+    ''' Load the tiff ice mask and cache it, keyed by file name.
+
+    The mask covers the whole region, so it is the same for every burst and
+    every frame, but readData reads the full map uncropped (~65 MB decoded for
+    the 250 m Greenland mask). Without the cache runCorrections re-reads it
+    once per burst -- 27 times per pair, 5 threads at a time -- which is the
+    largest repeated read in the correction and the one that has hung on a
+    stalled mount. The lock also stops the first read from being started by
+    several threads at once. interpGeo and RegularGridInterpolator only read
+    the object, so sharing one across threads is safe. '''
+    with _maskCacheLock:
+        if maskFile not in _maskCache:
+            maskData = u.geoimage(geoType='scalar')
+            maskData.readData(maskFile, tiff=True, dType='u1')
+            # RegularGridInterpolator casts any integer input to float64, so
+            # the uint8 mask would otherwise inflate 8x on the way in (65 MB
+            # -> 517 MB for the 250 m Greenland mask). float32 is already far
+            # more than a 0/1 mask needs and halves that.
+            maskData.x = maskData.x.astype(np.float32)
+            maskData.setupInterp(method='nearest')
+            _maskCache[maskFile] = maskData
+        return _maskCache[maskFile]
+
+
 def getVel(llxy, regionDefs, sigma=1):
     ''' Read velocity and interpolate to the radar grid using xy from llxy'''
     # Ice mask (tiff mask used to zero out non-ice before correction)
     maskFile = regionDefs.region.get('icemaskTiff')
-    maskData = u.geoimage(geoType='scalar')
-    maskData.readData(maskFile, tiff=True, dType='u1')
-    maskData.setupInterp(method='nearest')
+    maskData = getIceMask(maskFile)
     mask = maskData.interpGeo(llxy['x'] * 0.001, llxy['y'] * 0.001)  # needs km
     mask[np.isnan(mask)] = 0
     # Velocity: multi-band VRT/tiff (band1 vx, band2 vy) or legacy base name
     # with separate .vx.tif/.vy.tif companions.
     velFile = regionDefs.velMap()
     if velFile.endswith('.vrt') or velFile.endswith('.tif'):
-        vx = interpVelBand(velFile, 1, llxy, sigma)
-        vy = interpVelBand(velFile, 2, llxy, sigma)
+        velData, velX, velY = readVelCrop(velFile, llxy)
+        vx = interpVelBand(velData, 1, velX, velY, llxy, sigma)
+        vy = interpVelBand(velData, 2, velX, velY, llxy, sigma)
     else:
         v = nisar.nisarVel(verbose=False)
         v.readDataFromTiff(velFile)
@@ -387,8 +437,16 @@ def duplicateUW():
 
 
 def runCorrections(dataPath, beamFiles, beamParams,  nDays, regionDefs,
-                   noAzCorrect, cpus=8):
-    ''' Run the azimuth corrections '''
+                   noAzCorrect, cpus=8, azThreads=3):
+    ''' Run the azimuth corrections.
+
+    azThreads is deliberately below the old hardcoded 5. Each thread holds
+    full-resolution lat/lon/x/y for its burst (~1.1 GB), so the threads
+    starting together produce an allocation spike -- and they start just as
+    topsApp finishes, having left RAM full of page cache. Sustained reclaim
+    over the following seconds is the PSI signature systemd-oomd kills on;
+    all three known kills landed in exactly this window. At ~84 s per burst,
+    dropping 5 -> 3 costs about 5 min per pair. '''
     if not noAzCorrect:
         threads = []
         for beam in beamFiles:
@@ -399,7 +457,7 @@ def runCorrections(dataPath, beamFiles, beamParams,  nDays, regionDefs,
                                           args=myArgs)
                 threads.append(thread)
         # Run threads
-        u.runMyThreads(threads, 5, 'azCorrections', prompt=False)
+        u.runMyThreads(threads, azThreads, 'azCorrections', prompt=False)
     #
     duplicateUW()  # Copy previous if not already copied
     #
@@ -587,7 +645,7 @@ def remapOutput(dataPath, regionDefs, gimpDir, intermediatePath,
 def runAzPhaseCorrect(dataPath, regionDefs, gimpDir, intermediatePath,
                       noAzCorrect=False, noPhaseRemove=False, reMap=True,
                       gimpConvertOnly=False, unwrapOnly=False, resetMask=False,
-                      cpus=8):
+                      cpus=8, azThreads=3):
     ''' Apply the burst-by-burst azimuth correction, unwrap with the simulated
     phase removed, and remap the result to intermediate and final GrIMP
     products.
@@ -614,7 +672,7 @@ def runAzPhaseCorrect(dataPath, regionDefs, gimpDir, intermediatePath,
             print('run az corrections')
             t0 = time.time()
             runCorrections(workPath, beamFiles, beamParams,  nDays, regionDefs,
-                           noAzCorrect, cpus=cpus)
+                           noAzCorrect, cpus=cpus, azThreads=azThreads)
             print(f'[TIME] azCorrect + mergebursts/filter: '
                   f'{time.time() - t0:.1f} s')
         #

@@ -11,11 +11,13 @@ import argparse
 import os
 import numpy as np
 import glob
+import re
 from bs4 import BeautifulSoup
 from datetime import datetime
 import sarfunc as s
 import rioxarray
 import rasterio
+import yaml
 from osgeo import gdal
 from subprocess import call
 
@@ -29,6 +31,13 @@ dataFiles = {'unw': 'filt_topophase.unw',
              'SECorrection': 'SECorrection.vrt',
              'region': None,
              'regionData': None}
+
+# A product with less than this much of its ice unwrapped is automatically
+# given a hard Exclude by summaryQA.
+EXCLUDEPERCENTVALID = 5.0
+# Marks an Exclude this code wrote, so a later re-run can clear its own
+# verdict without ever touching an Exclude placed by hand.
+AUTOEXCLUDETAG = 'AUTO-EXCLUDED by setupisceuw'
 
 
 def setupISCEArgs():
@@ -174,22 +183,44 @@ def setupOutputDir(iscePath, outputPath, orbit1):
     return outDir, newGeodat, frame1, frame2, nlr, nla
 
 
-def applyConnectedComponents(ccFile, uw):
-    ''' Keep only largest cc'''
+def applyConnectedComponents(ccFile, uw, iceMask=None):
+    ''' Keep a single connected component: the one covering the most ice, or -
+    with no ice mask - the largest overall. Label 0 is snaphu's unreliable
+    class and is never kept. Returns the component array for summaryQA.
+
+    Selecting on ice rather than on raw size matters: a large component lying
+    mostly on ocean/rock can otherwise beat a smaller one sitting entirely on
+    ice, discarding most of the usable phase. '''
     cc = readCC(ccFile)
-    labels = np.delete(np.unique(cc), [0])
-    counts = dict(zip(labels,
-                      [np.count_nonzero(cc == x) for x in labels if x != 0]))
-    maxKey = max(counts, key=counts.get)
-    uw[cc != maxKey] = -2.0e9
+    labels = [int(label) for label in np.unique(cc) if label != 0]
+    if not labels:
+        # snaphu found nothing reliable - the whole frame is invalid
+        u.mywarning(f'applyConnectedComponents: no components in {ccFile}')
+        uw[:] = -2.0e9
+        return cc
+    if iceMask is not None:
+        counts = {label: int(((cc == label) & iceMask).sum())
+                  for label in labels}
+    else:
+        counts = {label: int(np.count_nonzero(cc == label))
+                  for label in labels}
+    uw[cc != max(counts, key=counts.get)] = -2.0e9
+    return cc
 
 
-def applyMask(maskFile, georxa, uw):
-    #
-    if os.path.exists(maskFile):
-        print(maskFile)
-        iceMask = u.readImage(maskFile, georxa.nr, georxa.na, 'u1')
-        uw[iceMask != 1] = -2.0e9
+def readIceMask(maskFile, georxa):
+    ''' Boolean ice mask, or None when there is no mask file. Read before the
+    connected-component step, which now selects on it. '''
+    if not os.path.exists(maskFile):
+        return None
+    print(maskFile)
+    return u.readImage(maskFile, georxa.nr, georxa.na, 'u1') == 1
+
+
+def applyMask(iceMask, uw):
+    ''' Blank everything off the ice mask. '''
+    if iceMask is not None:
+        uw[~iceMask] = -2.0e9
 
 
 def applySETide(SETideFile, georxa, uw):
@@ -271,6 +302,174 @@ def writeRadarTiff(data, filename, description='', noData=-2.0e9):
     vrt = None
 
 
+def autoExclude(outDir, percentValid, measure):
+    ''' Write a hard Exclude when too little of the frame unwrapped, and
+    return whether it is now excluded.
+
+    A stale auto-Exclude is cleared when a re-run comes out above threshold,
+    but only if it carries AUTOEXCLUDETAG - a hand-placed Exclude is a human
+    decision and is never removed or overwritten here. '''
+    excludeFile = f'{outDir}/Exclude'
+    excluded = (percentValid is not None
+                and percentValid < EXCLUDEPERCENTVALID)
+    existing = ''
+    if os.path.exists(excludeFile):
+        with open(excludeFile) as fp:
+            existing = fp.read()
+    if existing and AUTOEXCLUDETAG not in existing:
+        u.mywarning(f'autoExclude: leaving hand-placed Exclude in {outDir} '
+                    f'untouched ({measure} = {percentValid}%)')
+        return excluded
+    if excluded:
+        with open(excludeFile, 'w') as fp:
+            print(f'{datetime.now()}: {AUTOEXCLUDETAG}: {measure} = '
+                  f'{percentValid}% (below {EXCLUDEPERCENTVALID}%) - too '
+                  f'little of this frame unwrapped to be useful for ties',
+                  file=fp)
+        print(f'wrote {excludeFile}: {measure} = {percentValid}%')
+    elif existing:
+        os.remove(excludeFile)
+        print(f'cleared stale auto-Exclude in {outDir} '
+              f'({measure} = {percentValid}%)')
+    return excluded
+
+
+def summaryQAfromProduct(productDir):
+    ''' Rebuild summaryQA.yaml from a finished product, for products whose ISCE
+    scratch is gone. Everything is read back from the product's own tiffs, so
+    the connected-component metrics cannot be recovered and are written None.
+
+    Note the coverage numbers reflect whatever component selection produced the
+    product - reprocessing with -remapOnly, where the scratch survives, gives
+    both the current selection and the full metrics. '''
+    productDir = productDir.rstrip('/')
+
+    def readIfPresent(stem):
+        ''' Read <stem>.tif, or fall back to <stem>.vrt for the older products
+        written as raw MSB rasters with a VRT sidecar. None if neither. '''
+        for pattern in (f'{stem}.tif', f'{stem}.vrt'):
+            hits = glob.glob(f'{productDir}/{pattern}')
+            if hits:
+                return rasterio.open(hits[0]).read()[0]
+        return None
+
+    uw = readIfPresent('*.isce.uw')
+    if uw is None:
+        u.mywarning(f'summaryQAfromProduct: no unwrapped phase in '
+                    f'{productDir}')
+        return None
+    sim = readIfPresent('simPhase')
+    corr = readIfPresent('*.isce.cor')
+    # Ice mask is a raw byte image; take its dimensions from the phase grid
+    iceMask = None
+    maskFile = f"{productDir}/{dataFiles['icemask']}"
+    if os.path.exists(maskFile):
+        na, nr = uw.shape
+        iceMask = u.readImage(maskFile, nr, na, 'u1') == 1
+    # Provenance from the product dir name and the pairinfo file
+    orbit1, frame = [int(v) for v in
+                     os.path.basename(productDir).split('_')[:2]]
+    meta = {'orbit1': orbit1, 'orbit2': None, 'frame': frame,
+            'date1': None, 'date2': None, 'temporalBaseline': None,
+            'looks': None, 'ionosphereEstimated':
+                os.path.exists(f'{productDir}/ionosphere.tif')}
+    pairFiles = glob.glob(f'{productDir}/*.pairinfo')
+    if pairFiles:
+        with open(pairFiles[0]) as fp:
+            pieces = fp.read().split()
+        if len(pieces) >= 4:
+            meta['orbit2'] = int(pieces[1])
+            meta['date1'], meta['date2'] = pieces[2], pieces[3]
+            meta['temporalBaseline'] = abs(
+                (datetime.strptime(pieces[3], '%Y-%m-%d')
+                 - datetime.strptime(pieces[2], '%Y-%m-%d')).days)
+    looks = re.search(r'\.(\d+x\d+)\.isce\.uw',
+                      ' '.join(os.listdir(productDir)))
+    if looks:
+        meta['looks'] = looks.group(1)
+    meta['rebuiltFromProduct'] = True
+    return summaryQA(productDir, uw, None, iceMask, sim, corr, meta)
+
+
+def summaryQA(outDir, uw, cc, iceMask, sim, corr, meta):
+    ''' Write summaryQA.yaml beside the product: coverage, scatter about the
+    simulated phase, correlation, and connected-component statistics. Written
+    into the product dir so it travels with the product when it is copied out
+    of scratch. All arrays are on the radar grid; phase values are radians.
+
+    Every key is always written, None where the input needed for it was not
+    available - QA rebuilt from a finished product (summaryQAfromProduct) has
+    no connected-component file, so those entries come out None. '''
+    def scalar(value, digits=4):
+        ''' Plain float (not np.float32) so yaml writes a number, not a blob;
+        None stays None. '''
+        return None if value is None else round(float(value), digits)
+
+    valid = uw > -1.99e9
+    anyValid = bool(valid.any())
+    qa = dict(meta)
+    qa['nr'], qa['na'] = int(uw.shape[1]), int(uw.shape[0])
+    qa['validPixels'] = int(valid.sum())
+    qa['percentValid'] = scalar(100.0 * valid.mean(), 2)
+    # Coverage over ice is what actually feeds the tie points; percentValid
+    # over the whole frame mixes that up with how much of it is ocean/rock.
+    qa['icePixels'] = int(iceMask.sum()) if iceMask is not None else None
+    qa['percentValidOnIce'] = scalar(
+        100.0 * (valid & iceMask).sum() / max(int(iceMask.sum()), 1), 2) \
+        if iceMask is not None else None
+    # Scatter about the simulated phase: how far the unwrapped result departs
+    # from the velocity/topography model. Only the standard deviation is
+    # meaningful - the unwrapped phase carries an arbitrary constant, so the
+    # mean of the residual says nothing.
+    qa['sigmaRelativeToSim'] = scalar(np.nanstd((uw - sim)[valid]), 3) \
+        if sim is not None and anyValid else None
+    qa['meanCorrelationAll'] = scalar(np.nanmean(corr), 4) \
+        if corr is not None else None
+    qa['meanCorrelationValid'] = scalar(np.nanmean(corr[valid]), 4) \
+        if corr is not None and anyValid else None
+    # Connected components. keptComponent is the one applyConnectedComponents
+    # kept; largest* vs bestOnIce* show what selecting on raw size instead of
+    # on ice would have given, so the difference stays visible.
+    for key in ('numberOfConnectedComponents', 'keptComponent',
+                'largestComponent', 'largestComponentPixels',
+                'largestComponentOnIcePixels', 'bestOnIceComponent',
+                'bestOnIceComponentPixels'):
+        qa[key] = None
+    if cc is not None:
+        sizes = {int(label): int(np.count_nonzero(cc == label))
+                 for label in np.unique(cc) if label != 0}
+        qa['numberOfConnectedComponents'] = len(sizes)
+        if sizes:
+            largest = max(sizes, key=sizes.get)
+            qa['largestComponent'] = largest
+            qa['largestComponentPixels'] = sizes[largest]
+            qa['keptComponent'] = largest
+            if iceMask is not None:
+                onIce = {label: int(((cc == label) & iceMask).sum())
+                         for label in sizes}
+                best = max(onIce, key=onIce.get)
+                qa['largestComponentOnIcePixels'] = onIce[largest]
+                qa['bestOnIceComponent'] = best
+                qa['bestOnIceComponentPixels'] = onIce[best]
+                qa['keptComponent'] = best
+    # Exclude on the on-ice coverage where there is a mask; without one the
+    # whole-frame number is all we have.
+    if iceMask is not None:
+        measure, percent = 'percentValidOnIce', qa['percentValidOnIce']
+    else:
+        measure, percent = 'percentValid', qa['percentValid']
+    qa['automaticallyExcluded'] = autoExclude(outDir, percent, measure)
+    qaFile = f'{outDir}/summaryQA.yaml'
+    with open(qaFile, 'w') as fp:
+        fp.write('# summaryQA.yaml - per-product quality metrics written by '
+                 'setupisceuw.summaryQA\n')
+        fp.write('# phase values are radians; sigmaRelativeToSim is the '
+                 'scatter of (unwrapped - simulated)\n')
+        yaml.safe_dump(qa, fp, default_flow_style=False, sort_keys=False)
+    print(f'wrote {qaFile}')
+    return qa
+
+
 def mapUW(iscePath, outDir, orbit1, orbit2, frame1, geodat, haveIceMask):
     ''' get the sign based on convention that orbit1 is earliest in time -
     negate if otherwise '''
@@ -283,11 +482,15 @@ def mapUW(iscePath, outDir, orbit1, orbit2, frame1, geodat, haveIceMask):
     unw = readUW(f'{iscePath}/{dataFiles["unw"]}')
     uw = mySign * unw[1]
     p = unw[0]
-    # con comp mask
-    applyConnectedComponents(f'{iscePath}/{dataFiles["unwcc"]}', uw)
-    # ice mask
+    # ice mask is read first: the connected-component choice is made on it
+    iceMask = None
     if haveIceMask:
-        applyMask(f"{outDir}/{dataFiles['icemask']}", georxa, uw)
+        iceMask = readIceMask(f"{outDir}/{dataFiles['icemask']}", georxa)
+    # con comp mask - keeps the component covering the most ice
+    cc = applyConnectedComponents(f'{iscePath}/{dataFiles["unwcc"]}', uw,
+                                  iceMask)
+    # ice mask
+    applyMask(iceMask, uw)
     # SE Correction
     if dataFiles['SECorrection'] is not None:
         applySETide(f'{iscePath}/{dataFiles["SECorrection"]}', georxa, uw)
@@ -320,6 +523,7 @@ def mapUW(iscePath, outDir, orbit1, orbit2, frame1, geodat, haveIceMask):
     os.remove(tmpUw)
     os.remove(f'{tmpUw}.interp')
     # Simulated (topo+motion) phase
+    phase, correlation = None, None
     if os.path.exists(f'{iscePath}/simPhase'):
         phase = np.fromfile(f'{iscePath}/simPhase',
                             dtype='float32').reshape(na, nr)
@@ -327,12 +531,23 @@ def mapUW(iscePath, outDir, orbit1, orbit2, frame1, geodat, haveIceMask):
     # Correlation
     if os.path.exists(f'{iscePath}/topophase.cor.vrt'):
         corr = readUW(f'{iscePath}/topophase.cor.vrt')
-        writeRadarTiff(corr[1], f'{outDir}/{corName}.tif', 'correlation')
+        correlation = corr[1]
+        writeRadarTiff(correlation, f'{outDir}/{corName}.tif', 'correlation')
     # Ionosphere estimate - EXPORTED for evaluation, NOT applied to the phase
-    if os.path.exists(f'{iscePath}/topophase.ion.vrt'):
+    haveIon = os.path.exists(f'{iscePath}/topophase.ion.vrt')
+    if haveIon:
         ion = readUW(f'{iscePath}/topophase.ion.vrt')
         writeRadarTiff(ion[-1], f'{outDir}/ionosphere.tif',
                        'ionosphere phase (not applied)')
+    # Quality metrics, from the arrays already in hand
+    summaryQA(outDir, uw, cc, iceMask, phase, correlation,
+              {'orbit1': orbit1, 'orbit2': orbit2, 'frame': frame1,
+               'date1': orbDates[orbit1].date(),
+               'date2': orbDates[orbit2].date(),
+               'temporalBaseline':
+                   abs((orbDates[orbit2] - orbDates[orbit1]).days),
+               'looks': f'{georxa.nlr}x{georxa.nla}',
+               'ionosphereEstimated': haveIon})
     return orbDates, georxa
 
 

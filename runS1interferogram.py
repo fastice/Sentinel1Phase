@@ -38,7 +38,9 @@ import glob
 import os
 import re
 import shutil
+import signal
 import sys
+import threading
 import time
 import traceback
 import zipfile
@@ -100,6 +102,17 @@ def cmdLineParse():
                         'manifest)')
     parser.add_argument('--cpus', type=int, default=None,
                         help='OMP thread count [threads[host] or isce.cpus]')
+    parser.add_argument('--stallMinutes', type=int, default=None,
+                        help='abort if the run makes no progress for this '
+                        'many minutes [project stallMinutes, or 30]')
+    parser.add_argument('--azThreads', type=int, default=None,
+                        help='bursts corrected concurrently; lower spreads '
+                        'the allocation spike that has drawn oomd kills '
+                        '[project azThreads, or 3]')
+    parser.add_argument('--pressureLimit', type=int, default=None,
+                        help='release the scratch page cache when this run\'s '
+                        'cgroup memory pressure (PSI avg10) exceeds this '
+                        'percent; 0 disables [project pressureLimit, or 20]')
     parser.add_argument('--debug', action='store_true', default=False,
                         help='keep the ISCE and intermediate files in scratch')
     parser.add_argument('--keepScratch', action='store_true', default=False,
@@ -121,19 +134,30 @@ def cmdLineParse():
 def resolveSafe(name, dataDir, archiveDir=None):
     ''' Absolute path to a SAFE zip. Looks for an existing path, then in
     dataDir, then across the archive's YYYY-MM subdirs (so cross-month pairs
-    resolve). Accepts .zip or .zip.1. '''
-    if os.path.exists(name):
-        return os.path.abspath(name)
-    candidate = os.path.join(dataDir, name)
-    if os.path.exists(candidate):
-        return candidate
-    if archiveDir:
-        hits = glob.glob(os.path.join(
-            archiveDir, '[0-9][0-9][0-9][0-9]-[0-9][0-9]', name))
-        if hits:
-            return hits[0]
-    u.myerror(f'resolveSafe: SAFE file not found: {name} (also tried '
-              f'{candidate} and {archiveDir}/*/)')
+    resolve).
+
+    The .zip / .zip.1 suffix is not part of the granule identity, so both are
+    tried at every location: .1 is the marker fileS1 writes once a granule has
+    been unpacked into the assembly tree, so the same granule answers to either
+    name depending on whether the nightly filing run has reached it yet. A
+    queue line naming one must still resolve if filing renamed it in the
+    meantime. '''
+    stem = os.path.basename(name).split('.zip')[0]
+    directory = os.path.dirname(name)
+    for candidateName in (f'{stem}.zip', f'{stem}.zip.1'):
+        asGiven = os.path.join(directory, candidateName)
+        if os.path.exists(asGiven):
+            return os.path.abspath(asGiven)
+        candidate = os.path.join(dataDir, candidateName)
+        if os.path.exists(candidate):
+            return candidate
+        if archiveDir:
+            hits = glob.glob(os.path.join(
+                archiveDir, '[0-9][0-9][0-9][0-9]-[0-9][0-9]', candidateName))
+            if hits:
+                return hits[0]
+    u.myerror(f'resolveSafe: SAFE file not found: {stem}[.zip|.zip.1] (also '
+              f'tried {dataDir} and {archiveDir}/*/)')
 
 
 def safeStem(safePath):
@@ -353,12 +377,250 @@ def copyProduct(productDir, outputRoot, track):
     return dest
 
 
+class KilledBySignal(Exception):
+    ''' A fatal signal, turned into an exception so it reaches the fail-record
+    path instead of ending the run silently. returncode follows the shell
+    convention of 128 + signal number. '''
+
+    def __init__(self, signalNumber):
+        self.signalNumber = signalNumber
+        self.returncode = 128 + signalNumber
+        super().__init__(f'killed by '
+                         f'{signal.Signals(signalNumber).name} '
+                         f'(signal {signalNumber})')
+
+
+def installSignalHandlers():
+    ''' Convert the catchable fatal signals into KilledBySignal, so a job that
+    is terminated still logs why and writes a Fail record.
+
+    SIGKILL cannot be caught. That is the point: with these installed, a run
+    that dies leaving no record at all was SIGKILLed - in practice the OOM
+    killer - and the absence of a record becomes the diagnosis rather than an
+    ambiguity. SIGINT is left alone so Ctrl-C keeps its usual behaviour; it is
+    caught as KeyboardInterrupt in main instead. '''
+    def handler(signalNumber, frame):
+        raise KilledBySignal(signalNumber)
+
+    for name in ('SIGHUP', 'SIGTERM'):
+        signal.signal(getattr(signal, name), handler)
+
+
+class StalledRun(RuntimeError):
+    ''' The run stopped making progress. Carries EX_TEMPFAIL (75) so a stall
+    is distinguishable from a real processing failure in exitStatus.log, and
+    so a queue driver can treat it as retryable. '''
+
+    def __init__(self, minutes, where):
+        self.returncode = 75
+        super().__init__(f'stalled: no CPU time used and nothing written to '
+                         f'the run log for {minutes:.1f} min; {where}')
+
+
+def stackDump():
+    ''' Innermost frame of every live thread, to name what the run was doing
+    when it stopped. This is what was missing from the hung Aug-24 jobs: the
+    logs ended mid-stage with no indication of which read never returned. '''
+    lines = []
+    for threadId, frame in sorted(sys._current_frames().items()):
+        if threadId == threading.get_ident():   # the watchdog itself
+            continue
+        stack = traceback.extract_stack(frame)
+        inner = stack[-1]
+        lines.append(f'  thread {threadId}: '
+                     f'{os.path.basename(inner.filename)}:{inner.lineno} '
+                     f'in {inner.name}(): {(inner.line or "").strip()}')
+    return lines
+
+
+def ownCgroupDir():
+    ''' This process's cgroup v2 directory, or None if unavailable. '''
+    try:
+        with open('/proc/self/cgroup') as fp:
+            for line in fp:
+                field = line.strip().split(':')
+                if field[0] != '0':        # 0:: is the unified hierarchy
+                    continue
+                path = os.path.join('/sys/fs/cgroup', field[2].lstrip('/'))
+                if os.path.exists(os.path.join(path, 'memory.current')):
+                    return path
+    except OSError:
+        pass
+    return None
+
+
+def cgroupBytes(cgroupDir):
+    ''' Current charge against this cgroup: anon plus its share of the page
+    cache. This is the number systemd-oomd weighs, which is why the page cache
+    a run leaves behind can get it killed. '''
+    try:
+        with open(os.path.join(cgroupDir, 'memory.current')) as fp:
+            return int(fp.read())
+    except (OSError, ValueError):
+        return 0
+
+
+def cgroupPressure(cgroupDir):
+    ''' PSI memory-pressure avg10 for this cgroup, as a percentage.
+
+    This is the signal systemd-oomd actually acts on -- not a byte count. It
+    measures the share of time this cgroup's tasks spent stalled waiting on
+    memory reclaim, so a run streaming tens of GB through the page cache
+    registers pressure even on a machine with hundreds of GB free. Shedding
+    well below oomd's limit keeps the run clear of it.
+
+    Prefers the "full" line (every task stalled), which is what oomd compares
+    against; falls back to "some" where "full" is absent. '''
+    avg10 = {}
+    try:
+        with open(os.path.join(cgroupDir, 'memory.pressure')) as fp:
+            for line in fp:
+                field = line.split()
+                for item in field[1:]:
+                    key, _, value = item.partition('=')
+                    if key == 'avg10':
+                        avg10[field[0]] = float(value)
+    except (OSError, ValueError, IndexError):
+        return 0.
+    return avg10.get('full', avg10.get('some', 0.))
+
+
+def dropFileCache(root, minBytes=64 * 1024 ** 2):
+    ''' Release the page cache holding the large files under root, returning
+    the bytes released.
+
+    A pair writes ~86 GB of ISCE scratch, and those file pages stay charged to
+    the cgroup that touched them long after the stage that wrote them is done.
+    They are clean and reclaimable, so nothing is lost by handing them back --
+    the kernel re-reads on demand -- but while they sit there they count
+    toward the memory-pressure limit that killed the Aug-24 runs.
+
+    fsync first: only clean pages can be dropped. Symlinks are skipped so this
+    stays inside the scratch tree and does not touch the source SAFE archive.
+    '''
+    released = 0
+    for dirPath, _, fileNames in os.walk(root):
+        for name in fileNames:
+            path = os.path.join(dirPath, name)
+            try:
+                if os.path.islink(path) or os.path.getsize(path) < minBytes:
+                    continue
+                fd = os.open(path, os.O_RDONLY)
+            except OSError:
+                continue
+            try:
+                os.fsync(fd)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                released += os.path.getsize(path)
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
+    return released
+
+
+def startWatchdog(logPath, failPath, scratchPath, limitMinutes,
+                  pressureLimit=None, interval=60):
+    ''' Abort the run if it stops making progress, instead of hanging until
+    someone notices days later.
+
+    Progress is either CPU time used by this process and its children, or a
+    write to the run log. Between them they cover every stage: topsApp runs
+    with our own CPU idle but tees continuously to the log, and the in-process
+    stages burn CPU without touching the log. A stalled run does neither.
+
+    The watchdog thread reports and exits the process itself rather than
+    signalling the main thread, because the main thread may be blocked in a C
+    extension where a signal would not be delivered until the call returns.
+    Note the limit of this, and of any in-process approach: a thread stuck in
+    an uninterruptible kernel wait (a hard NFS mount that never answers) dies
+    only when that wait ends -- os._exit cannot preempt it either. '''
+    def cpuSeconds():
+        t = os.times()
+        return t.user + t.system + t.children_user + t.children_system
+
+    def logMtime():
+        try:
+            return os.path.getmtime(logPath)
+        except OSError:
+            return 0.
+
+    cgroupDir = ownCgroupDir() if pressureLimit else None
+
+    def governor(selfCpu, governorHold):
+        ''' Release the scratch page cache when this cgroup's memory pressure
+        rises, before it reaches the limit oomd acts on. Returns the updated
+        (selfCpu, governorHold). '''
+        pressure = cgroupPressure(cgroupDir)
+        if pressure <= pressureLimit:
+            return selfCpu, governorHold
+        used = cgroupBytes(cgroupDir)
+        t0 = time.thread_time()
+        dropFileCache(scratchPath)
+        selfCpu += time.thread_time() - t0
+        freed = used - cgroupBytes(cgroupDir)
+        # Back off when little comes back: the pressure is then coming from
+        # something other than our scratch (another job sharing the scope),
+        # and re-walking the tree every tick would cost more than it saves.
+        quiet = freed < 1024 ** 3
+        if quiet:
+            governorHold = time.time() + 10 * interval
+        note = ' (little left here, backing off)' if quiet else ''
+        log(f'governor: memory pressure {pressure:.0f}%, cgroup at '
+            f'{used / 1024 ** 3:.0f} GB, released '
+            f'{max(freed, 0) / 1024 ** 3:.1f} GB{note}')
+        return selfCpu, governorHold
+
+    def monitor():
+        lastCpu, lastLog, lastProgress = cpuSeconds(), logMtime(), time.time()
+        selfCpu, governorHold, lastCheck = 0., 0., time.time()
+        # avg10 is a 10 s average and oomd acts after 20 s over its limit, so
+        # the governor is polled on a short tick; the stall check, which is
+        # comparing minutes, stays on the full interval.
+        tick = min(interval, 10)
+        while True:
+            time.sleep(tick)
+            if cgroupDir is not None and time.time() >= governorHold:
+                selfCpu, governorHold = governor(selfCpu, governorHold)
+            if time.time() - lastCheck < interval:
+                continue
+            lastCheck = time.time()
+            # Discount the governor's own CPU, or shedding cache would
+            # register as progress and mask a genuine stall.
+            cpu, mtime = cpuSeconds() - selfCpu, logMtime()
+            # 1 s of CPU over the interval: enough to clear timer noise, far
+            # below what any real stage uses.
+            if cpu > lastCpu + 1.0 or mtime > lastLog:
+                lastCpu, lastLog, lastProgress = cpu, mtime, time.time()
+                continue
+            stalled = (time.time() - lastProgress) / 60.
+            if stalled < limitMinutes:
+                continue
+            threads = stackDump()
+            exc = StalledRun(stalled, f'{len(threads)} threads, innermost '
+                                      f'frames follow')
+            log(f'WATCHDOG: {exc}')
+            for line in threads:
+                log(line)
+            log(f'scratch kept for debugging: {scratchPath}')
+            log(f'fail record: '
+                f'{writeFailFile(failPath, exc.returncode, exc, logPath)}')
+            sys.stdout.flush()
+            os._exit(exc.returncode)
+
+    threading.Thread(target=monitor, daemon=True,
+                     name='watchdog').start()
+
+
 def exitCode(exc):
-    ''' Exit code to report for a failure: the ISCE command's own code when we
-    have it, the code from a u.myerror abort (SystemExit) otherwise, else 1. '''
+    ''' Exit code to report for a failure: the ISCE command's own code or a
+    signal's 128+n when we have it, the code from a u.myerror abort
+    (SystemExit) otherwise, else 1. '''
     code = getattr(exc, 'returncode', None)
     if code is None and isinstance(exc, SystemExit):
         code = exc.code
+    if code is None and isinstance(exc, KeyboardInterrupt):
+        code = 128 + signal.SIGINT
     return code if isinstance(code, int) and code != 0 else 1
 
 
@@ -366,6 +628,8 @@ def failMessage(exc):
     ''' One-line description of a failure. A u.myerror abort raises a bare
     SystemExit carrying no message (myerror prints it to the console), so fall
     back to the source line that aborted - skipping myerror itself. '''
+    if isinstance(exc, KeyboardInterrupt):
+        return 'interrupted from the terminal (Ctrl-C / SIGINT)'
     message = str(exc)
     if message:
         return message
@@ -389,29 +653,42 @@ def writeFailFile(failPath, code, exc, logPath):
 
 def main():
     args = cmdLineParse()
-    project = uwp.loadProject(args.project)
-    isceenv.setEnv(project.get('isceEnv'))
-    regionDefs = uwp.regionDefsFromProject(project)
-    scratch = uwp.scratchForHost(project)
-    cpus = args.cpus if args.cpus is not None else uwp.threadsForHost(project)
+    # Setup is guarded separately from the run below: u.myerror calls a bare
+    # sys.exit(), which is SystemExit(None) and so exits 0 - a missing SAFE or
+    # an unresolvable track would otherwise be recorded as a success by the
+    # caller. No Fail record is possible this early (its name is built from the
+    # very values being computed here), so this reports and exits non-zero; the
+    # queue's exitStatus.log is what captures it.
+    try:
+        project = uwp.loadProject(args.project)
+        isceenv.setEnv(project.get('isceEnv'))
+        regionDefs = uwp.regionDefsFromProject(project)
+        scratch = uwp.scratchForHost(project)
+        cpus = args.cpus if args.cpus is not None \
+            else uwp.threadsForHost(project)
 
-    # Resolve and parse the two SAFE files
-    refPath = resolveSafe(args.reference, project['dataDir'],
-                          project.get('archiveDir'))
-    secPath = resolveSafe(args.secondary, project['dataDir'],
-                          project.get('archiveDir'))
-    ref = parseSafe(refPath)
-    sec = parseSafe(secPath)
-    manifest = readManifest(refPath)
-    track = args.track if args.track is not None \
-        else trackFromManifest(manifest)
-    if track is None:
-        u.myerror('main: could not determine track; pass --track')
-    # Frame is for naming only, so an unreadable manifest is not fatal here
-    frame = frameFromManifest(manifest, ref['start'])
-    if frame is None:
-        print('main: could not determine frame from manifest; naming logs 0')
-        frame = 0
+        # Resolve and parse the two SAFE files
+        refPath = resolveSafe(args.reference, project['dataDir'],
+                              project.get('archiveDir'))
+        secPath = resolveSafe(args.secondary, project['dataDir'],
+                              project.get('archiveDir'))
+        ref = parseSafe(refPath)
+        sec = parseSafe(secPath)
+        manifest = readManifest(refPath)
+        track = args.track if args.track is not None \
+            else trackFromManifest(manifest)
+        if track is None:
+            u.myerror('main: could not determine track; pass --track')
+        # Frame is for naming only, so an unreadable manifest is not fatal here
+        frame = frameFromManifest(manifest, ref['start'])
+        if frame is None:
+            print('main: could not determine frame from manifest; '
+                  'naming logs 0')
+            frame = 0
+    except (Exception, SystemExit, KeyboardInterrupt) as exc:
+        code = exitCode(exc)
+        print(f'FAILED during setup (exit {code}): {failMessage(exc)}')
+        sys.exit(code)
     o1, o2 = ref['absOrbit'], sec['absOrbit']
     # Frames of one datatake share absolute orbits, so tag scratch/log with the
     # reference acquisition start time to keep frames from colliding.
@@ -439,6 +716,19 @@ def main():
     log(f'track {track} frame {frame}: reference {o1} ({ref["date"].date()}), '
         f'secondary {o2} ({sec["date"].date()})')
     log(f'host scratch {scratch}; cpus {cpus}; log {logPath}')
+
+    # From here on a fatal signal is recorded rather than ending the run
+    # silently, as happened to an overnight job that left no trace of why.
+    installSignalHandlers()
+    stallMinutes = args.stallMinutes if args.stallMinutes is not None \
+        else project.get('stallMinutes', 30)
+    pressureLimit = args.pressureLimit if args.pressureLimit is not None \
+        else project.get('pressureLimit', 20)
+    startWatchdog(logPath, failPath, pairScratch, stallMinutes,
+                  pressureLimit=pressureLimit)
+    governed = (f'; release scratch page cache above {pressureLimit}% '
+                f'memory pressure' if pressureLimit else '')
+    log(f'watchdog: abort after {stallMinutes} min without progress{governed}')
 
     tStart = time.time()
     try:
@@ -474,10 +764,13 @@ def main():
             os.chdir(startDir)
 
         # Burst correction, unwrap, and remap to the GrIMP product
+        azThreads = args.azThreads if args.azThreads is not None \
+            else project.get('azThreads', 3)
         productDir = timed('azPhaseCorrect (total)', apc.runAzPhaseCorrect,
                            isceDir, regionDefs, gimpDir, intermediatePath,
                            noAzCorrect=args.noAzCorrect,
                            noPhaseRemove=args.noPhaseRemove, cpus=cpus,
+                           azThreads=azThreads,
                            gimpConvertOnly=args.remapOnly)
 
         # Copy the low-volume product out
@@ -486,8 +779,9 @@ def main():
         log(f'final product: {dest}')
         log(f'[TIME] TOTAL pipeline (excl. DEM): {time.time() - tStart:.1f} s')
     # SystemExit too: azPhaseCorrect / setupisceuw abort via u.myerror, which
-    # calls sys.exit and would otherwise skip the fail record.
-    except (Exception, SystemExit) as exc:
+    # calls sys.exit and would otherwise skip the fail record. KeyboardInterrupt
+    # and KilledBySignal cover Ctrl-C and SIGHUP/SIGTERM.
+    except (Exception, SystemExit, KeyboardInterrupt) as exc:
         code = exitCode(exc)
         log(f'FAILED (exit {code}): {failMessage(exc)}')
         log(traceback.format_exc())

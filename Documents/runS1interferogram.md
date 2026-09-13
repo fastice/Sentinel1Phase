@@ -36,8 +36,43 @@ goes to stderr, so stdout stays pipeable):
 
 ```
 findS1InsarPairs 25 --firstDate 2025-11-01 --queue > runQueue
-sh runQueue
+csh runQueue
 ```
+
+**The queue lines are csh, not sh** — they use `set rc = $status`, backticks,
+and `>>!`. Run them with `csh` (or paste them at a tcsh prompt); `sh runQueue`
+will not work.
+
+To also process pairs whose images are not downloaded yet, add `--onlinePairs`:
+the lines then begin with a [`pullASF`](../../asfSearchAndDownload/Documents/pullASF.md)
+that fetches whichever images the pair is missing before running it.
+
+```
+findS1InsarPairs all --onlinePairs --queue --firstDate 2024-01-01 --lastDate 2024-02-15 > runQueue
+csh runQueue
+```
+
+```
+pullASF <url1> <url2> --archiveDir <A> && runS1interferogram <f1> <f2> --project <p>; set rc = ...
+```
+
+One `pullASF` per pair, not one per granule: downloads are throttled to one at a
+time archive-wide, so fetching a whole pair under a single acquisition of that
+slot lets each job start computing while the next one downloads. stderr reports
+how many pairs need a download and **how much data that is** — a wide window can
+queue terabytes, and `--maxPairs` caps it.
+
+Each line appends its own exit status to `<outputRoot>/logs/exitStatus.log`:
+
+```
+2026-08-21T13:00:21 rc=0 track=2 frame=426 orbits=63424-63599
+```
+
+That record exists because `runS1interferogram` cannot report on its own death.
+A run killed by SIGKILL (`rc=137`, typically the OOM killer) or by a segfault in
+a native library (`rc=139`, e.g. GDAL/numpy) never executes any of its own code,
+so it writes no `Fail.*` record — the two cases are indistinguishable from the
+product tree alone, and `rc` is what separates them. See Failure reporting below.
 
 ---
 
@@ -45,7 +80,7 @@ sh runQueue
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `reference` | — | Reference (earlier) SLC SAFE zip. Path, or a basename resolved in `dataDir` then `archiveDir/YYYY-MM/`. `.zip` and the `.zip.1` partial-download suffix are both accepted. |
+| `reference` | — | Reference (earlier) SLC SAFE zip. Path, or a basename resolved in `dataDir` then `archiveDir/YYYY-MM/`. Both `.zip` and `.zip.1` are tried at each location, so the name resolves whichever suffix the file currently has — `.1` is the marker `fileS1` writes once a granule is unpacked into the assembly tree, and a queue line generated hours earlier must still resolve if filing renamed it since. |
 | `secondary` | — | Secondary SLC SAFE zip, same resolution rules. |
 | `--project PATH` | `uwproject.yaml` | Project yaml (see keys below). |
 | `--track N` | from manifest | Relative-orbit/track number. Read from `relativeOrbitNumber` in the reference `manifest.safe` if not given; aborts if neither is available. |
@@ -121,6 +156,7 @@ Outputs that survive cleanup:
 <outputRoot>/track-<N>/<orbit1>_<frame1>/                 final GrIMP product
 <outputRoot>/logs/<YYYY-MM-DD>/<track>.<orbit1>.<frame>.<runStamp>.log
 <outputRoot>/logs/<YYYY-MM-DD>/Fail.<track>.<orbit1>.<frame>.<runStamp>
+<outputRoot>/logs/exitStatus.log        one line per --queue run, all machines
 ```
 
 Logs are grouped by the **run** date, so one `logs/YYYY-MM-DD/` directory holds
@@ -180,15 +216,45 @@ The exit code is the failing ISCE command's own code where there is one —
 `isceenv.isceShell` raises `IsceCommandError` (a `RuntimeError` subclass
 carrying `returncode`) — otherwise 1.
 
-Two subtleties this handles:
+Three subtleties this handles:
 
 - `azPhaseCorrect` and `setupisceuw` abort via `u.myerror`, which calls
   `sys.exit()` and raises `SystemExit` — **not** an `Exception`. The handler
-  catches `(Exception, SystemExit)` so those aborts still produce a fail record.
+  catches `(Exception, SystemExit, KeyboardInterrupt)` so those aborts still
+  produce a fail record.
 - That bare `SystemExit` carries no message (myerror prints to the console), so
   `failMessage` falls back to the source line that aborted, skipping `myerror`
   itself:
   `SystemExit at runS1interferogram.py:271: u.myerror('prepareIsceDem: need ...`
+- `installSignalHandlers` turns SIGHUP and SIGTERM into `KilledBySignal`, whose
+  `returncode` is `128 + signal`, so a terminated run still records why:
+  `exitCode: 143 / error: killed by SIGTERM (signal 15)`. Ctrl-C keeps its
+  normal behaviour and is caught as `KeyboardInterrupt` (130).
+
+### What a *missing* record means
+
+SIGKILL and SIGSEGV cannot be intercepted — the process runs none of its own
+code — so those leave **no** `Fail.*` record at all. With the handlers above in
+place that absence is now diagnostic rather than ambiguous, and the queue's
+`exitStatus.log` says which one it was:
+
+| symptom | cause |
+|---|---|
+| `Fail.*` naming a signal | SIGHUP / SIGTERM (terminal closed, killed) |
+| no `Fail.*`, `rc=137` | SIGKILL — usually the OOM killer |
+| no `Fail.*`, `rc=139` | SIGSEGV — crash in a native library (GDAL, numpy) |
+| no `Fail.*`, no `rc` | run was not launched through a `--queue` line |
+| `rc` 64–70, no log at all | the `pullASF` ahead of it failed, so the run never started — see [pullASF](../../asfSearchAndDownload/Documents/pullASF.md) for the code |
+
+A failure during setup — an unresolvable SAFE, or a track that cannot be
+determined — now exits **1**. It previously exited 0, because `u.myerror` calls a
+bare `sys.exit()`; those checks run before the log dir exists, so they report to
+the console and exit non-zero rather than writing a `Fail.*` record whose name
+would be built from the very values that failed to resolve.
+
+The handlers are installed just before the main `try`, *after* module import.
+Import takes ~5 s (rasterio, rioxarray, sarfunc, GDAL), so a signal inside that
+first few seconds still goes unrecorded.
 
 > Not to be confused with `azPhaseCorrect.logFail`, which drops an unrelated
 > `fail.<pid>` marker into the *current directory* (i.e. inside scratch, removed
