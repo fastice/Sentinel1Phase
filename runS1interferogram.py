@@ -731,6 +731,9 @@ def main():
     log(f'watchdog: abort after {stallMinutes} min without progress{governed}')
 
     tStart = time.time()
+    # Set once topsApp has produced burst interferograms: only then does the
+    # scratch hold anything a rerun can reuse (--remapOnly).
+    topsAppDone = args.remapOnly
     try:
         if args.remapOnly:
             # Recover a run that got as far as the unwrap: reuse the scratch
@@ -762,6 +765,7 @@ def main():
                   'topsApp.py --end=burstifg', ompThreads=cpus,
                   ompPlaces='sockets(1)')
             os.chdir(startDir)
+            topsAppDone = True
 
         # Burst correction, unwrap, and remap to the GrIMP product
         azThreads = args.azThreads if args.azThreads is not None \
@@ -785,7 +789,19 @@ def main():
         code = exitCode(exc)
         log(f'FAILED (exit {code}): {failMessage(exc)}')
         log(traceback.format_exc())
-        log(f'scratch kept for debugging: {pairScratch}')
+        if topsAppDone or args.debug or args.keepScratch:
+            log(f'scratch kept for debugging: {pairScratch}')
+        else:
+            # A failure before topsApp finished (most often ESD's "Coherence
+            # threshold too strict") leaves ~40 GB nothing can reuse; keep
+            # only the ISCE logs beside the run log.
+            for name in ('isce.log', 'insar.log', 'topsApp.xml'):
+                src = os.path.join(isceDir, name)
+                if os.path.exists(src):
+                    shutil.copy(src, f'{logPath[:-4]}.{name}')
+            shutil.rmtree(pairScratch, ignore_errors=True)
+            log(f'removed scratch {pairScratch} (failed before topsApp '
+                f'finished; ISCE logs copied beside this log)')
         log(f'fail record: {writeFailFile(failPath, code, exc, logPath)}')
         sys.exit(code)
 
